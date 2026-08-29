@@ -1,0 +1,219 @@
+# Main File
+"""
+RubyOS System Manager - application entry point.
+
+Responsibility
+--------------
+This module is the application shell and the ONLY owner of the GUI lifecycle:
+
+  * It creates the single ``tk.Tk()`` root window and calls ``mainloop()``.
+    No other module in this project is allowed to do either of those things.
+  * It builds the ``ttk.Notebook`` and mounts one feature tab per module:
+        Tab 1  monitor.SystemMonitor      - live CPU / RAM / disk
+        Tab 2  process_manager.ProcessManager - real process control
+        Tab 3  file_explorer.FileExplorer - real filesystem operations
+        Tab 4  optimizer.AdaptiveOptimizer - real process optimization
+  * It owns the shared status bar that the tabs write messages into.
+  * It handles clean shutdown: the window-close event calls ``shutdown()`` on
+    every tab so their worker threads stop BEFORE ``root.destroy()`` runs.
+    Without this the process keeps running after the window closes.
+
+Nothing here talks to psutil or the filesystem directly - that belongs to the
+feature modules.
+"""
+
+# File Explorer
+"""
+File explorer tab - real filesystem browsing and file operations.
+
+Responsibility
+--------------
+Browsing and modifying the actual filesystem. Every operation here is a real
+os/shutil call against real paths on disk; nothing is simulated.
+
+  * Browsing: os.scandir() / pathlib.Path fills a ttk.Treeview with
+        Name | Type | Size | Modified
+    Double-click a folder to enter it, "Up" navigates to the parent, and the
+    drive roots come from psutil.disk_partitions().
+
+  * Information panel for the selected entry: full path, size in bytes,
+    modified timestamp, and whether it is read-only - read from
+    os.stat() / Path.stat().
+
+  * Real operations:
+        os.mkdir(path)          create folder
+        os.rename(src, dst)     rename file or folder
+        os.remove(path)         delete file
+        shutil.rmtree(path)     delete folder and its contents
+
+  * Deletion always goes through a confirmation dialog first - it is
+    permanent, not a move to the recycle bin.
+
+  * Error handling: PermissionError, FileNotFoundError and FileExistsError are
+    routine here (protected system folders, files open in another program) and
+    are reported to the user in a dialog rather than raised.
+
+Out of scope by design: copy/move, progress tracking, and background file
+workers. Operations are small and synchronous, which is what keeps this tab
+predictable and the GUI responsive without extra plumbing.
+"""
+
+# Monitor
+"""
+System monitor tab - live CPU, RAM and disk usage.
+
+Responsibility
+--------------
+The read-only dashboard. It reports REAL machine state from psutil; it never
+simulates or fabricates values.
+
+  * A background sampler thread polls, on a fixed interval:
+        psutil.cpu_percent(interval=...)          overall CPU load
+        psutil.cpu_percent(percpu=True)           optional per-core load
+        psutil.virtual_memory()                   RAM total / used / percent
+        psutil.disk_usage(path)                   disk total / used / percent
+  * Samples are pushed onto a queue.Queue. The Tk main thread drains that queue
+    from a periodic ``after()`` callback and updates the widgets. psutil is
+    never called on the GUI thread, and Tk widgets are never touched from the
+    worker thread - that is the rule that keeps this from freezing or crashing.
+  * Display is numeric labels plus ttk.Progressbar widgets only. No graphs and
+    no history buffer are kept.
+
+This module owns no application window; it builds itself into the parent
+widget handed to it by main.py.
+"""
+
+# Optimizer
+"""
+Adaptive Process Resource Optimizer tab.
+
+Responsibility
+--------------
+This module watches the REAL process table (via psutil) and produces resource
+optimization recommendations - and, optionally, applies them - the same way
+an OS-level resource manager or task scheduler would react to load. Nothing
+here is simulated: every number comes from a live psutil scan, and every
+priority change is a real Windows scheduling-priority change on a real PID.
+
+OS resource management, in plain terms
+---------------------------------------
+An operating system's scheduler decides which ready process gets CPU time
+next, largely based on each process's *scheduling priority*. A process stuck
+at high CPU for a long time, or one sitting idle, is exactly the kind of
+signal a resource manager uses to re-balance the system: demote a CPU hog so
+interactive apps stay responsive, and demote long-idle processes so they
+don't compete for scheduling slots they don't need. This module automates
+that same judgment call using psutil.Process.nice() - on Windows, "nice"
+maps onto the Windows priority classes (IDLE_PRIORITY_CLASS ...
+REALTIME_PRIORITY_CLASS) that the Windows scheduler itself uses to order
+ready threads. Changing that value does not stop or throttle a process
+directly; it changes how favorably the OS scheduler treats it relative to
+everything else competing for the CPU.
+
+Threading model (mirrors monitor.py / process_manager.py exactly)
+-------------------------------------------------------------------
+  * A single background daemon thread (_analysis_loop) runs the psutil scan
+    every ANALYSIS_INTERVAL seconds. It NEVER touches a Tk widget - Tkinter
+    is not thread-safe, and calling widget methods from a worker thread is a
+    common source of GUI freezes/crashes. Scanning hundreds of processes
+    (each a small blocking syscall) on the GUI thread would freeze the whole
+    application for the duration of the scan; running it on its own thread
+    keeps the window responsive no matter how long a scan takes.
+  * Each cycle's results (an analysis snapshot dict) are pushed onto a
+    queue.Queue. The GUI thread drains that queue from a periodic
+    self.after() callback and is the ONLY code that ever updates widgets.
+  * threading.Event is used twice, exactly as process_manager.py does:
+      _stop_event  - set once, by shutdown(), to end the thread for good.
+      _wake_event  - set to force an immediate cycle (the "Analyze Now"
+                     button) instead of waiting out the rest of the interval.
+      _auto_event  - set/cleared by the two mode buttons; read every cycle by
+                     the worker thread to decide whether to only *recommend*
+                     or to actually *apply* a priority change.
+
+Classification (every ANALYSIS_INTERVAL seconds, per accessible process)
+--------------------------------------------------------------------------
+  CPU Heavy     cpu_percent > CPU_HEAVY_THRESHOLD
+  Memory Heavy  memory_percent > MEM_HEAVY_THRESHOLD   (warning only - never
+                                                         auto-acted on)
+  Idle          ALL of: cpu_percent < IDLE_CPU_THRESHOLD for
+                IDLE_STREAK_REQUIRED consecutive cycles (sustained idle, not
+                one quiet tick - about a minute by default), memory_percent
+                >= IDLE_MIN_MEMORY_PERCENT (skip negligible-footprint
+                processes - nothing worth reclaiming from them), and the
+                process is still at Normal priority (nothing left to
+                recommend otherwise). These three conditions exist because a
+                literal "CPU < 1%" alone flags most of a typical Windows
+                process table - the vast majority of background services sit
+                near 0% CPU almost permanently.
+
+Recommendation Mode (default) only ever displays a recommendation. Auto
+Optimization Mode additionally calls psutil.Process(pid).nice(...) to step a
+CPU Heavy or Idle process from Normal down to Below Normal priority - the
+exact transition asked for in the spec - and logs the real change. Processes
+are never terminated automatically, and Memory Heavy is always a warning
+only, in either mode.
+
+Protection: this application's own PID (os.getpid()) and a fixed list of
+core OS/session processes (System, System Idle Process, Explorer, csrss,
+wininit, winlogon, services, lsass, smss, dwm, svchost, Registry) are
+excluded from analysis entirely - they are never classified, recommended, or
+modified.
+
+Error handling: psutil.NoSuchProcess, psutil.AccessDenied and
+psutil.ZombieProcess are expected, routine conditions (a process exits mid
+scan, or belongs to another user/session) and are caught per-process so one
+inaccessible process can never crash the scan or the application.
+"""
+
+# Process Manager
+"""
+Process manager tab - real control over real OS processes.
+
+Responsibility
+--------------
+This is the module that actually touches the operating system's process table.
+Every action here affects real processes on the machine; nothing is simulated.
+
+  * Listing: psutil.process_iter() populates a ttk.Treeview with
+        PID | Parent PID | Name | CPU % | Memory % | Status | Threads
+    Parent PID (Process.ppid()) makes the real parent-child process tree the
+    OS maintains visible - e.g. a launched Notepad shows this application's
+    PID as its parent. Column headers are clickable to sort. The refresh runs
+    on a background thread; results cross to the GUI thread via a queue.Queue
+    drained on an after() timer, and only the Tk main thread ever touches the
+    tree.
+
+  * Control actions on the selected PID (all real psutil calls):
+        Process.terminate()   - request the process end
+        Process.suspend()     - freeze the process (SIGSTOP / Windows equiv.)
+        Process.resume()      - unfreeze it
+        Process.nice(value)   - change scheduling priority
+    Priority control is the OS-scheduling piece of the project: on Windows the
+    values are the psutil.*_PRIORITY_CLASS constants, on POSIX a nice integer
+    (-20 highest priority .. 19 lowest).
+
+  * Launch Process: subprocess.Popen() asks the operating system to create a
+    brand new real process (e.g. notepad.exe). Windows assigns it a real PID
+    and records this application's PID as its parent - the same process
+    creation and parent-child relationship covered in the OS process model.
+    The list refreshes right after a successful launch, and the newly created
+    PID is automatically selected/scrolled into view in the tree once it
+    appears ("jump to newly created process").
+
+  * Search/filter: a search box filters the real rows already collected by
+    the refresh thread - by PID, Parent PID, or Name substring. It never adds
+    or fabricates rows; it only changes which of the real psutil rows are
+    displayed, and re-applies on every refresh until cleared.
+
+  * Error handling is mandatory, not optional - these failures happen
+    constantly in normal use and must surface as dialogs, never be swallowed:
+        psutil.NoSuchProcess   process exited between listing and acting
+        psutil.AccessDenied    system/other-user process, or needs elevation
+        psutil.ZombieProcess   process is a zombie entry
+
+  * Safety: the app refuses to terminate its own PID (os.getpid()), and every
+    terminate is preceded by a confirmation dialog.
+
+Out of scope by design: open-file lists, network connections, and
+parent/children trees.
+"""

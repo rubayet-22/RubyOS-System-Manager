@@ -1,0 +1,9 @@
+# RubyOS System Manager - dependencies
+#
+# psutil is the only third-party package. Everything else the project uses is
+# in the Python standard library: tkinter (GUI), threading, queue, os, shutil,
+# pathlib.
+#
+# Install with:  py -m pip install -r requirements.txt
+
+psutil>=5.9
