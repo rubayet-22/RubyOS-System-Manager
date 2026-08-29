@@ -1,6 +1,6 @@
 # RubyOS System Manager
 
-🎥 **Video Presentation:** [Watch the Project Demonstration]((https://youtu.be/57MwhS7SuYA))
+🎥 Video Presentation: [Watch the Project Demonstration](https://youtu.be/57MwhS7SuYA)
 
 ## Overview
 
